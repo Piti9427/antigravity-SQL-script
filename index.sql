@@ -160,7 +160,6 @@ main_data AS (
 
       ktb.O_BS_LAWYER_FEE         AS "ค่าธรรมเนียม",
       ar.ORG AS "หักองค์กรนายจ้าง",
-      sysdate AS "ข้อมูล ณ",
 
       ROW_NUMBER() OVER (PARTITION BY bc.ACC_NO ORDER BY bc.ACC_NO) AS rn
 
@@ -195,6 +194,8 @@ main_data AS (
 
   LEFT JOIN bills_summary tb
     ON ar.ACC_NO = tb.ACCOUNT_NO
+
+  WHERE bc.ACC_NO IN ('1000611078', '1004570732')
 )
 
 /* =========================================================
@@ -229,6 +230,18 @@ SELECT
     HA_TAMNAME,
     HA_AMPNAME,
     HA_PROVNAME,
-    HA_MOICODE
+    HA_MOICODE,
+    HA_POSTAL_CODE,
+    TOTAL_AMT,
+    "ภาระหนี้คงเหลือ (ยอดปิดบัญชี)",
+    "เงินต้นคงเหลือ",
+    "ดอกเบี้ย",
+    "เบี้ยปรับ",
+    "ยอดหนี้ค้างชำระ (ยอดผิดนัดชำระหนี้)",
+    "ยอดหนี้เงินต้นค้างชำระ",
+    "ดอกเบี้ยเงินต้นค้างชำระ",
+    "เบี้ยปรับเงินต้นค้างชำระ",
+    "ค่าธรรมเนียม",
+    "หักองค์กรนายจ้าง"
 FROM main_data
 WHERE rn = 1;
