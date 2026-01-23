@@ -3,22 +3,23 @@
 
 WITH
 /* =========================================================
-   CTE 0: Scope List (ดึง List บัญชีมาดักไว้ก่อน เพื่อ Performance)
+   CTE 0: Scope List (เพิ่ม Filter Account ตรงนี้จุดเดียวจบ)
    ========================================================= */
 scope_list AS (
-    SELECT /*+ MATERIALIZE PARALLEL(4) */ 
-           ACC_NO, CID, CIF 
+    SELECT /*+ MATERIALIZE PARALLEL(4) */
+           ACC_NO, CID, CIF
     FROM PGETMP.LIST_ACC_BROKEN_CONTRACT
+--     WHERE ACC_NO = '1003371922' -- [ADDED] กรองเฉพาะบัญชีนี้
 ),
 
 /* =========================================================
-   CTE 0.1: Cutoff Logic (ถอดมาจาก Store SP_BUILD_MV_KTB_DAY_PUNCH)
+   CTE 0.1: Cutoff Logic (ถอดมาจาก Store Procedure)
    ========================================================= */
 cutoff_check AS (
   SELECT /*+ MATERIALIZE */
-    -- V2: ใช้วันที่ปัจจุบัน (ตาม Store ที่ให้มา)
-    SYSDATE AS cutoff_v2,
-    
+    -- V2: ใช้วันที่ปัจจุบัน (SYSDATE)
+    TRUNC(SYSDATE) AS cutoff_v2,
+
     -- V1: ตัดรอบที่ 5 ก.ค. ของปี
     CASE
        WHEN SYSDATE < TO_DATE(TO_CHAR(EXTRACT(YEAR FROM SYSDATE)) || '0705','YYYYMMDD')
@@ -32,7 +33,7 @@ cutoff_check AS (
  1) bill_ver: เลือก version
  ========================================================= */
 bill_ver AS (
-  SELECT /*+ MATERIALIZE PARALLEL(b 4) */
+  SELECT /*+ MATERIALIZE PARALLEL(b 44) */
     TRIM(b.account_no) as account_no,
     CASE
       WHEN MAX(CASE WHEN NVL(b.version, 1) = 2 THEN 1 ELSE 0 END) = 1 THEN 2
@@ -44,7 +45,7 @@ bill_ver AS (
 ),
 
 /* =========================================================
- 2) bills_summary: รวมยอด Bills (ใช้ Logic Cutoff จาก Store)
+ 2) bills_summary: รวมยอด Bills (ใช้ Logic Cutoff + Filter Scope)
  ========================================================= */
 bills_summary AS (
   SELECT /*+ MATERIALIZE PARALLEL(b 4) */
@@ -54,19 +55,19 @@ bills_summary AS (
     SUM(NVL(b.fine_cal_amount, 0))         AS sum_fine
   FROM DMS.DMS_TRN_BILLS b
   JOIN bill_ver bv ON TRIM(bv.account_no) = TRIM(b.account_no)
-  CROSS JOIN cutoff_check c -- เอาวันที่ตัดรอบมาใช้
+  CROSS JOIN cutoff_check c
   WHERE b.status = '1'
     AND b.closed_date IS NULL
     AND NVL(b.version, 1) = bv.pick_version
     AND EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = TRIM(b.account_no))
-    
-    -- [CRITICAL UPDATE] ใช้ Logic Cutoff ตาม Store Procedure
+
+    -- [LOGIC CUTOFF] เช็ควันครบกำหนดตาม Version
     AND (
-      (bv.pick_version = 2 AND b.DUE_PERIOD <= c.cutoff_v2) -- V2: ตัดที่ปัจจุบัน
+      (bv.pick_version = 2 AND b.DUE_PERIOD <= c.cutoff_v2)
       OR
-      (bv.pick_version = 1 AND b.DUE_PERIOD < c.cutoff_v1)  -- V1: ตัดที่ 5 ก.ค.
+      (bv.pick_version = 1 AND b.DUE_PERIOD < c.cutoff_v1)
     )
-    
+
   GROUP BY TRIM(b.account_no)
 ),
 
@@ -78,7 +79,7 @@ contract_pick AS (
     TRIM(cid) as cid,
     TRIM(stu_bank_code) as stu_bank_code
   FROM (
-      SELECT /*+ PARALLEL(c 16) PARALLEL(rb2 16) */
+      SELECT /*+ PARALLEL(c 4) PARALLEL(rb2 4) */
         c.cid,
         c.stu_bank_code,
         ROW_NUMBER() OVER (
@@ -89,7 +90,8 @@ contract_pick AS (
         ) rn
       FROM DMSDBA.CONTRACT c
       LEFT JOIN DMSDBA.RDBBANK rb2 ON c.stu_bank_code = rb2.bank_code
-      WHERE EXISTS (SELECT 1 FROM scope_list s WHERE TRIM(s.CID) = TRIM(c.cid))
+      WHERE EXISTS (SELECT 1 FROM scope_list s WHERE TRIM(DBMS_LOB.SUBSTR(s.CID, 13, 1)) = TRIM(c.cid))
+
     )
   WHERE rn = 1
 ),
@@ -226,10 +228,7 @@ main_data AS (
     ktb.O_BS_ACCRUED_INTEREST      AS "ดอกเบี้ย",
     ktb.O_BS_ACCRUED_FINE          AS "เบี้ยปรับ",
 
-    /* [LOGIC FROM STORE]
-       - ยอดหนี้ค้างชำระ (Overdue) มาจาก CTE bills_summary ที่ใช้ Cutoff Logic แล้ว
-       - ดึงแยกยอด ต้น, ดอก, ปรับ ออกมาโชว์
-    */
+    /* ยอดหนี้ค้างชำระที่ใช้ Logic Cutoff จาก Store Procedure */
     (NVL(tb.sum_installment, 0) + NVL(tb.sum_interest, 0) + NVL(tb.sum_fine, 0)) AS "ยอดหนี้ค้างชำระ (ยอดผิดนัดชำระหนี้)",
     NVL(tb.sum_installment, 0) AS "ยอดหนี้เงินต้นค้างชำระ",
     (NVL(tb.sum_interest, 0) + NVL(tid.INTEREST, 0)) AS "ดอกเบี้ยเงินต้นค้างชำระ",
@@ -245,20 +244,26 @@ main_data AS (
 
     ROW_NUMBER() OVER (PARTITION BY bc.ACC_NO ORDER BY bc.ACC_NO) AS rn
 
-  FROM PGETMP.LIST_ACC_BROKEN_CONTRACT bc
-  LEFT JOIN contract_pick c ON TRIM(bc.CID) = TRIM(c.CID)
+  FROM scope_list bc -- [CHANGED] เริ่มต้นจาก Scope List ที่กรอง Account แล้ว
+  LEFT JOIN contract_pick c ON TRIM(DBMS_LOB.SUBSTR(bc.CID, 13, 1)) = TRIM(c.CID)
   LEFT JOIN DMSDBA.RDBBANK rb ON c.STU_BANK_CODE = rb.BANK_CODE
   LEFT JOIN DMS.MV_DMS_ACC_REPORT ar ON TRIM(bc.ACC_NO) = TRIM(ar.ACC_NO)
   LEFT JOIN rsm_safe rsm ON TRIM(bc.ACC_NO) = TRIM(rsm.ACC_NO)
+
+  -- [FIXED] Join Person ด้วย TO_NUMBER(TRIM(CIF))
   LEFT JOIN DMSDBA.PERSON pr ON TO_NUMBER(TRIM(bc.CIF)) = TO_NUMBER(pr.CIF)
+
   LEFT JOIN DMSDBA.LOAN_ACCOUNT la ON TRIM(bc.ACC_NO) = TRIM(la.ACC_NO)
   LEFT JOIN DMS.DMS_TRN_INPUT_FOR_RECAL fr ON TRIM(bc.ACC_NO) = TRIM(fr.ACCOUNT_NO)
+
   LEFT JOIN DMS.DMS_TRN_BILL_SUMMARY tbs
     ON TRIM(bc.ACC_NO) = TRIM(tbs.ACCOUNT_NO)
    AND tbs.VERSION = CASE WHEN fr.RESTRUCTURE_FLAG = 'Y' THEN 2 ELSE 1 END
+
   LEFT JOIN DMS.DMS_TRN_CAL_INT_ADD_DAY tid ON TRIM(bc.ACC_NO) = TRIM(tid.ACCOUNT_NO)
   LEFT JOIN DMS.MV_KTB_DAY_22_01_2026 ktb ON TRIM(bc.ACC_NO) = TRIM(ktb.ACC_NO)
   LEFT JOIN bills_summary tb ON TRIM(bc.ACC_NO) = TRIM(tb.ACCOUNT_NO)
+
   LEFT JOIN log_cal_max lc ON TRIM(bc.ACC_NO) = TRIM(lc.account_no)
 )
 
