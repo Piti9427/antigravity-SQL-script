@@ -1,38 +1,72 @@
-ALTER SESSION ENABLE PARALLEL QUERY;
-ALTER SESSION ENABLE PARALLEL DML;
+-- ALTER SESSION ENABLE PARALLEL QUERY;
+-- ALTER SESSION ENABLE PARALLEL DML;
 
 WITH
 /* =========================================================
- 1) bill_ver: เลือก version (TRIM + NULL Handle)
+   CTE 0: Scope List (ดึง List บัญชีมาดักไว้ก่อน เพื่อ Performance)
+   ========================================================= */
+scope_list AS (
+    SELECT /*+ MATERIALIZE PARALLEL(4) */ 
+           ACC_NO, CID, CIF 
+    FROM PGETMP.LIST_ACC_BROKEN_CONTRACT
+),
+
+/* =========================================================
+   CTE 0.1: Cutoff Logic (ถอดมาจาก Store SP_BUILD_MV_KTB_DAY_PUNCH)
+   ========================================================= */
+cutoff_check AS (
+  SELECT /*+ MATERIALIZE */
+    -- V2: ใช้วันที่ปัจจุบัน (ตาม Store ที่ให้มา)
+    SYSDATE AS cutoff_v2,
+    
+    -- V1: ตัดรอบที่ 5 ก.ค. ของปี
+    CASE
+       WHEN SYSDATE < TO_DATE(TO_CHAR(EXTRACT(YEAR FROM SYSDATE)) || '0705','YYYYMMDD')
+       THEN TO_DATE(TO_CHAR(EXTRACT(YEAR FROM SYSDATE)) || '0705','YYYYMMDD')             -- ปีนี้
+       ELSE ADD_MONTHS(TO_DATE(TO_CHAR(EXTRACT(YEAR FROM SYSDATE)) || '0705','YYYYMMDD'), 12) -- ปีหน้า
+    END AS cutoff_v1
+  FROM DUAL
+),
+
+/* =========================================================
+ 1) bill_ver: เลือก version
  ========================================================= */
 bill_ver AS (
-  SELECT /*+ MATERIALIZE PARALLEL(b 32) */
+  SELECT /*+ MATERIALIZE PARALLEL(b 4) */
     TRIM(b.account_no) as account_no,
     CASE
       WHEN MAX(CASE WHEN NVL(b.version, 1) = 2 THEN 1 ELSE 0 END) = 1 THEN 2
       ELSE 1
     END AS pick_version
   FROM DMS.DMS_TRN_BILLS b
---   WHERE TRIM(b.account_no) = '1056510381' -- [Key Point] TRIM Account
+  WHERE EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = TRIM(b.account_no))
   GROUP BY TRIM(b.account_no)
 ),
 
 /* =========================================================
- 2) bills_summary: รวมยอด Bills (TRIM Join)
+ 2) bills_summary: รวมยอด Bills (ใช้ Logic Cutoff จาก Store)
  ========================================================= */
 bills_summary AS (
-  SELECT /*+ MATERIALIZE PARALLEL(b 32) */
+  SELECT /*+ MATERIALIZE PARALLEL(b 4) */
     TRIM(b.account_no) as account_no,
     SUM(NVL(b.installment_cal_amount, 0)) AS sum_installment,
-    SUM(NVL(b.interest_cal_amount, 0)) AS sum_interest,
-    SUM(NVL(b.fine_cal_amount, 0)) AS sum_fine
+    SUM(NVL(b.interest_cal_amount, 0))     AS sum_interest,
+    SUM(NVL(b.fine_cal_amount, 0))         AS sum_fine
   FROM DMS.DMS_TRN_BILLS b
-    JOIN bill_ver bv ON TRIM(bv.account_no) = TRIM(b.account_no)
+  JOIN bill_ver bv ON TRIM(bv.account_no) = TRIM(b.account_no)
+  CROSS JOIN cutoff_check c -- เอาวันที่ตัดรอบมาใช้
   WHERE b.status = '1'
     AND b.closed_date IS NULL
     AND NVL(b.version, 1) = bv.pick_version
---     AND TRIM(b.account_no) = '1056510381'
-    AND b.DUE_PERIOD < TRUNC(SYSDATE)
+    AND EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = TRIM(b.account_no))
+    
+    -- [CRITICAL UPDATE] ใช้ Logic Cutoff ตาม Store Procedure
+    AND (
+      (bv.pick_version = 2 AND b.DUE_PERIOD <= c.cutoff_v2) -- V2: ตัดที่ปัจจุบัน
+      OR
+      (bv.pick_version = 1 AND b.DUE_PERIOD < c.cutoff_v1)  -- V1: ตัดที่ 5 ก.ค.
+    )
+    
   GROUP BY TRIM(b.account_no)
 ),
 
@@ -40,7 +74,7 @@ bills_summary AS (
  3) contract_pick: เลือกเฉพาะคอลัมน์ (TRIM CID)
  ========================================================= */
 contract_pick AS (
-  SELECT /*+ MATERIALIZE PARALLEL(32) */
+  SELECT /*+ MATERIALIZE PARALLEL(4) */
     TRIM(cid) as cid,
     TRIM(stu_bank_code) as stu_bank_code
   FROM (
@@ -50,32 +84,45 @@ contract_pick AS (
         ROW_NUMBER() OVER (
           PARTITION BY c.cid
           ORDER BY CASE WHEN rb2.bank_code IS NOT NULL THEN 0 ELSE 1 END,
-            CASE WHEN c.stu_bank_code IS NOT NULL THEN 0 ELSE 1 END,
-            c.rowid DESC
+                   CASE WHEN c.stu_bank_code IS NOT NULL THEN 0 ELSE 1 END,
+                   c.rowid DESC
         ) rn
       FROM DMSDBA.CONTRACT c
-        LEFT JOIN DMSDBA.RDBBANK rb2 ON c.stu_bank_code = rb2.bank_code
+      LEFT JOIN DMSDBA.RDBBANK rb2 ON c.stu_bank_code = rb2.bank_code
+      WHERE EXISTS (SELECT 1 FROM scope_list s WHERE TRIM(s.CID) = TRIM(c.cid))
     )
   WHERE rn = 1
 ),
 
 /* =========================================================
  4) rsm_safe: ดึง RSM และแปลง CLOB
-    - [FIXED] เพิ่ม LOAN_TYPE เข้ามาแล้ว
  ========================================================= */
 rsm_safe AS (
-  SELECT /*+ MATERIALIZE PARALLEL(32) */
+  SELECT /*+ MATERIALIZE PARALLEL(4) */
     TRIM(ACC_NO) as ACC_NO,
-    LOAN_TYPE,  -- [FIXED] ต้องมีบรรทัดนี้ ข้อมูลถึงจะออก
+    LOAN_TYPE,
     STA_CODE,
     LOAN_ACC_STATUS,
     GROUP_FLAG,
     END_CONTRACT_DATE,
     NO_OF_LATE_BILL,
     LAST_PAYMENT_DATE,
+    ENTITY,
     DBMS_LOB.SUBSTR(LOAN_CLASSIFICATION, 100, 1) as LOAN_CLASS_STR
   FROM DMSDBA.REPORT_SUMMARY_MONTH
---   WHERE TRIM(ACC_NO) = '1056510381'
+  WHERE EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = TRIM(ACC_NO))
+),
+
+/* =========================================================
+ 4.1) log_cal_max: เอา MAX(CAL_DATE)
+ ========================================================= */
+log_cal_max AS (
+  SELECT /*+ MATERIALIZE PARALLEL(lc 4) */
+    TRIM(lc.account_no) AS account_no,
+    MAX(lc.cal_date)    AS max_cal_date
+  FROM DMS.DMS_LOG_CAL lc
+  WHERE EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = TRIM(lc.account_no))
+  GROUP BY TRIM(lc.account_no)
 ),
 
 /* =========================================================
@@ -86,13 +133,16 @@ main_data AS (
     /*+
        QB_NAME(main)
        LEADING(bc)
-       USE_HASH(bc ar c rb rsm pr la fr tbs tid ktb tb)
-       PARALLEL(bc 32)
+       USE_HASH(bc ar c rb rsm pr la fr tbs tid ktb tb lc)
+       PARALLEL(bc 4)
     */
-    NVL(rb.BANK_NAME_TH, '(ไม่พบธนาคาร)') AS "ดูแลบัญชีโดย",
+    CASE
+        WHEN rsm.ENTITY = 'KTB' THEN 'ธนาคารกรุงไทย จำกัด (มหาชน)'
+        WHEN rsm.ENTITY = 'IBANK' THEN 'ธนาคารอิสลามแห่งประเทศไทย'
+        ELSE NVL(rb.BANK_NAME_TH, '(ไม่พบธนาคาร)')
+    END AS "ดูแลบัญชีโดย",
     bc.ACC_NO AS "เลขที่บัญชี",
 
-    -- ใช้ LOAN_TYPE จาก rsm_safe (เพราะ ar อาจจะ null)
     COALESCE(ar.LOAN_TYPE, rsm.LOAN_TYPE) AS "ประเภทบัญชี",
     rsm.LOAN_ACC_STATUS AS "รหัสสถานะบัญชี",
 
@@ -124,15 +174,13 @@ main_data AS (
     bc.CIF AS "รหัสผู้กู้",
     bc.CID AS "เลขประจำตัวประชาชน",
 
-    -- ดึงชื่อจาก PERSON ถ้า ar ไม่มี
     COALESCE(ar.TITLE_NAME, TO_CHAR(pr.HR_TITLE)) AS TITLE_NAME,
-    COALESCE(ar.HR_NAME, pr.HR_NAME) AS HR_NAME,
-    COALESCE(ar.HR_SURNAME, pr.HR_SURNAME) AS HR_SURNAME,
+    COALESCE(ar.HR_NAME, pr.HR_NAME)             AS HR_NAME,
+    COALESCE(ar.HR_SURNAME, pr.HR_SURNAME)       AS HR_SURNAME,
 
     rsm.LAST_PAYMENT_DATE,
     rsm.NO_OF_LATE_BILL,
 
-    -- Loan Class
     CASE
       WHEN rsm.LOAN_CLASS_STR = 'A1' THEN 'ปกติ'
       WHEN rsm.LOAN_CLASS_STR = 'A2' THEN 'ค้างชำระ 1 วัน'
@@ -148,7 +196,6 @@ main_data AS (
     rsm.GROUP_FLAG,
     rsm.END_CONTRACT_DATE,
 
-    -- ที่อยู่จาก PERSON (pr)
     pr.HA_NO,
     pr.HA_BUILDING,
     pr.HA_FLOOR,
@@ -167,14 +214,22 @@ main_data AS (
     la.TOTAL_AMT,
 
     CASE
-      WHEN NVL(fr.RESTRUCTURE_FLAG, 'N') <> 'Y' THEN NVL(tbs.CAPITAL_REMAIN, 0) + NVL(tbs.ACCRUED_INTEREST, 0) + NVL(tbs.ACCRUED_FINE, 0) + NVL(tid.INTEREST, 0) + NVL(tid.FINE, 0)
-      WHEN fr.RESTRUCTURE_FLAG = 'Y' THEN NVL(tbs.CAPITAL_REMAIN, 0) + NVL(tbs.ACCRUED_INTEREST, 0) + NVL(tbs.CARRY_INTEREST, 0) + NVL(tid.INTEREST, 0)
+      WHEN NVL(fr.RESTRUCTURE_FLAG, 'N') <> 'Y'
+        THEN NVL(tbs.CAPITAL_REMAIN, 0) + NVL(tbs.ACCRUED_INTEREST, 0) + NVL(tbs.ACCRUED_FINE, 0)
+           + NVL(tid.INTEREST, 0) + NVL(tid.FINE, 0)
+      WHEN fr.RESTRUCTURE_FLAG = 'Y'
+        THEN NVL(tbs.CAPITAL_REMAIN, 0) + NVL(tbs.ACCRUED_INTEREST, 0) + NVL(tbs.CARRY_INTEREST, 0)
+           + NVL(tid.INTEREST, 0)
     END AS "ภาระหนี้คงเหลือ (ยอดปิดบัญชี)",
 
-    ktb.O_BS_CAPITAL_REMAIN AS "เงินต้นคงเหลือ",
-    ktb.O_BS_ACCRUED_INTEREST AS "ดอกเบี้ย",
-    ktb.O_BS_ACCRUED_FINE AS "เบี้ยปรับ",
+    ktb.O_BS_CAPITAL_REMAIN        AS "เงินต้นคงเหลือ",
+    ktb.O_BS_ACCRUED_INTEREST      AS "ดอกเบี้ย",
+    ktb.O_BS_ACCRUED_FINE          AS "เบี้ยปรับ",
 
+    /* [LOGIC FROM STORE]
+       - ยอดหนี้ค้างชำระ (Overdue) มาจาก CTE bills_summary ที่ใช้ Cutoff Logic แล้ว
+       - ดึงแยกยอด ต้น, ดอก, ปรับ ออกมาโชว์
+    */
     (NVL(tb.sum_installment, 0) + NVL(tb.sum_interest, 0) + NVL(tb.sum_fine, 0)) AS "ยอดหนี้ค้างชำระ (ยอดผิดนัดชำระหนี้)",
     NVL(tb.sum_installment, 0) AS "ยอดหนี้เงินต้นค้างชำระ",
     (NVL(tb.sum_interest, 0) + NVL(tid.INTEREST, 0)) AS "ดอกเบี้ยเงินต้นค้างชำระ",
@@ -185,37 +240,32 @@ main_data AS (
     END AS "เบี้ยปรับเงินต้นค้างชำระ",
 
     ktb.O_BS_LAWYER_FEE AS "ค่าธรรมเนียม",
-    ar.ORG AS "หักองค์กรนายจ้าง",
-    sysdate AS "ข้อมูล ณ",
+    ar.ORG              AS "หักองค์กรนายจ้าง",
+    lc.max_cal_date     AS "ข้อมูล ณ",
+
     ROW_NUMBER() OVER (PARTITION BY bc.ACC_NO ORDER BY bc.ACC_NO) AS rn
+
   FROM PGETMP.LIST_ACC_BROKEN_CONTRACT bc
-    -- Join ar (ไว้ดึงชื่อถ้ามี)
-    LEFT JOIN DMS.MV_DMS_ACC_REPORT ar ON TRIM(bc.ACC_NO) = TRIM(ar.ACC_NO)
-
-    -- [FIXED] Join Contract ด้วย TRIM ปกติ (ไม่ต้องใช้ LOB)
-    LEFT JOIN contract_pick c ON TRIM(DBMS_LOB.SUBSTR(bc.CID, 13, 1)) = TRIM(c.CID)
-    LEFT JOIN DMSDBA.RDBBANK rb ON c.STU_BANK_CODE = rb.BANK_CODE
-
-    -- Join RSM
-    LEFT JOIN rsm_safe rsm ON TRIM(bc.ACC_NO) = TRIM(rsm.ACC_NO)
-
-    -- [CRITICAL FIX] ใช้ TO_NUMBER เพื่อแก้ปัญหา '00123' vs '123'
-    LEFT JOIN DMSDBA.PERSON pr ON TO_NUMBER(TRIM(bc.CIF)) = TO_NUMBER(pr.CIF)
-
-    LEFT JOIN DMSDBA.LOAN_ACCOUNT la ON TRIM(bc.ACC_NO) = TRIM(la.ACC_NO)
-    LEFT JOIN DMS.DMS_TRN_INPUT_FOR_RECAL fr ON TRIM(bc.ACC_NO) = TRIM(fr.ACCOUNT_NO)
-    LEFT JOIN DMS.DMS_TRN_BILL_SUMMARY tbs ON TRIM(bc.ACC_NO) = TRIM(tbs.ACCOUNT_NO)
-        AND tbs.VERSION = CASE WHEN fr.RESTRUCTURE_FLAG = 'Y' THEN 2 ELSE 1 END
-    LEFT JOIN DMS.DMS_TRN_CAL_INT_ADD_DAY tid ON TRIM(bc.ACC_NO) = TRIM(tid.ACCOUNT_NO)
-    LEFT JOIN DMS.MV_KTB_DAY_22_01_2026 ktb ON TRIM(bc.ACC_NO) = TRIM(ktb.ACC_NO)
-    LEFT JOIN bills_summary tb ON TRIM(bc.ACC_NO) = TRIM(tb.ACCOUNT_NO)
---   WHERE TRIM(bc.ACC_NO) = '1056510381'
+  LEFT JOIN contract_pick c ON TRIM(bc.CID) = TRIM(c.CID)
+  LEFT JOIN DMSDBA.RDBBANK rb ON c.STU_BANK_CODE = rb.BANK_CODE
+  LEFT JOIN DMS.MV_DMS_ACC_REPORT ar ON TRIM(bc.ACC_NO) = TRIM(ar.ACC_NO)
+  LEFT JOIN rsm_safe rsm ON TRIM(bc.ACC_NO) = TRIM(rsm.ACC_NO)
+  LEFT JOIN DMSDBA.PERSON pr ON TO_NUMBER(TRIM(bc.CIF)) = TO_NUMBER(pr.CIF)
+  LEFT JOIN DMSDBA.LOAN_ACCOUNT la ON TRIM(bc.ACC_NO) = TRIM(la.ACC_NO)
+  LEFT JOIN DMS.DMS_TRN_INPUT_FOR_RECAL fr ON TRIM(bc.ACC_NO) = TRIM(fr.ACCOUNT_NO)
+  LEFT JOIN DMS.DMS_TRN_BILL_SUMMARY tbs
+    ON TRIM(bc.ACC_NO) = TRIM(tbs.ACCOUNT_NO)
+   AND tbs.VERSION = CASE WHEN fr.RESTRUCTURE_FLAG = 'Y' THEN 2 ELSE 1 END
+  LEFT JOIN DMS.DMS_TRN_CAL_INT_ADD_DAY tid ON TRIM(bc.ACC_NO) = TRIM(tid.ACCOUNT_NO)
+  LEFT JOIN DMS.MV_KTB_DAY_22_01_2026 ktb ON TRIM(bc.ACC_NO) = TRIM(ktb.ACC_NO)
+  LEFT JOIN bills_summary tb ON TRIM(bc.ACC_NO) = TRIM(tb.ACCOUNT_NO)
+  LEFT JOIN log_cal_max lc ON TRIM(bc.ACC_NO) = TRIM(lc.account_no)
 )
 
 /* =========================================================
  Final SELECT
  ========================================================= */
-SELECT /*+ PARALLEL(m 32) */
+SELECT /*+ PARALLEL(m 4) */
   "ดูแลบัญชีโดย",
   "เลขที่บัญชี",
   "ประเภทบัญชี",
