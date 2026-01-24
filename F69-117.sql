@@ -10,40 +10,41 @@ scope_list AS (
   SELECT /*+ MATERIALIZE PARALLEL(64) */
     ACC_NO,
     CID
-  FROM PGETMP.list_account_f69_117_2
-  -- WHERE ACC_NO = '1003193781' -- Uncomment เพื่อเทสรายคน
+  FROM PGETMP.list_account_f69_117
+  -- WHERE ACC_NO = '1000047458'
 ),
 
 /* =========================================================
- 1) bill_ver: เลือก version ปัจจุบัน
+ 1) bill_ver: ให้ "เหมือนสคริปต์เล็ก" (MAX(version) จาก BILL_SUMMARY)
 ========================================================= */
 bill_ver AS (
-    SELECT /*+ MATERIALIZE PARALLEL(b 32) */
-           b.account_no,
-           CASE
-             WHEN MAX(CASE WHEN b.version = 2 THEN 1 ELSE 0 END) = 1 THEN 2
-             ELSE 1
-           END AS pick_version
-    FROM DMS.DMS_TRN_BILLS b
-    WHERE b.status = '1'
-    AND EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = b.account_no) -- Join Scope
-    GROUP BY b.account_no
+  SELECT /*+ MATERIALIZE PARALLEL(b 32) */
+    b.account_no,
+    MAX(b.version) AS pick_version
+  FROM DMS.DMS_TRN_BILL_SUMMARY b
+  WHERE EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = b.account_no)
+  GROUP BY b.account_no
 ),
 
 /* =========================================================
- 2) bill_stats: นับจำนวนงวดที่ผิดนัดชำระ
+ 2) bill_stats: นับจำนวนงวดที่ผิดนัดชำระ (Logic: ค้างจริง)
 ========================================================= */
 bill_stats AS (
     SELECT /*+ MATERIALIZE PARALLEL(b 32) */
            b.account_no,
-           COUNT(CASE WHEN NVL(b.fINE_AMOUNT, 0) > 0 THEN 1 END) AS cnt_default
+           COUNT(CASE
+             WHEN b.STATUS = '1'
+              AND b.CLOSED_DATE IS NULL
+              AND b.DUE_PERIOD < TRUNC(SYSDATE)
+             THEN 1
+           END) AS cnt_default
     FROM DMS.DMS_TRN_BILLS b
-    WHERE EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = b.account_no) -- Join Scope
+    WHERE EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = b.account_no)
     GROUP BY b.account_no
 ),
 
 /* =========================================================
- 3) inst_plan: หายอดผ่อนชำระจากตาราง Installment
+ 3) inst_plan: หายอดผ่อนชำระต่อเดือน (V2)
 ========================================================= */
 inst_plan AS (
     SELECT /*+ MATERIALIZE PARALLEL(i 16) */
@@ -52,7 +53,7 @@ inst_plan AS (
              OVER (PARTITION BY account_no ORDER BY periods DESC) AS installment_amt
     FROM DMS.DMS_MST_INSTALLMENTS i
     WHERE i.version = 2
-    AND EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = i.account_no) -- Join Scope
+    AND EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = i.account_no)
 ),
 
 /* =========================================================
@@ -67,23 +68,13 @@ fee_calc AS (
            ABS(SUM(CASE WHEN NVL(s.fee4, 0) < 0 THEN NVL(s.fee4, 0) ELSE 0 END)) AS fee4_new
     FROM DMSDBA.ACCOUNT_STATEMENT s
     WHERE s.tran_type IN ('4','2')
-      AND EXISTS (SELECT 1 FROM scope_list sc WHERE sc.ACC_NO = s.acc_no) -- Join Scope
+      AND EXISTS (SELECT 1 FROM scope_list sc WHERE sc.ACC_NO = s.acc_no)
       AND (
-            ( s.tran_code LIKE '%ADJMON%'
-              AND (NVL(s.remark,'') LIKE '%ค่าทนายความ%' OR NVL(s.remark,'') LIKE '%ค่าฤชา%')
-              AND NVL(s.remark,'') NOT LIKE '%ชำระ%'
-            )
-         OR ( s.tran_code LIKE '%ADJMON%'
-              AND (s.tran_userid LIKE '%FIX_LES%' OR s.tran_userid LIKE '%DMSFIX%')
-            )
-         OR s.tran_code LIKE '%DEPTER_FEE%'
-         OR s.tran_code LIKE '%ADJMONR%'
-         OR s.tran_code LIKE '%ADJLEGAL%'
-         OR s.tran_code LIKE '%REPAY%'
-         OR s.tran_code LIKE '%PAYOFF%'
+            ( s.tran_code LIKE '%ADJMON%' AND (NVL(s.remark,'') LIKE '%ค่าทนายความ%' OR NVL(s.remark,'') LIKE '%ค่าฤชา%') AND NVL(s.remark,'') NOT LIKE '%ชำระ%' )
+         OR ( s.tran_code LIKE '%ADJMON%' AND (s.tran_userid LIKE '%FIX_LES%' OR s.tran_userid LIKE '%DMSFIX%') )
+         OR s.tran_code IN ('DEPTER_FEE', 'ADJMONR', 'ADJLEGAL', 'REPAY', 'PAYOFF')
       )
-      AND s.tran_flag = 'N'
-      AND s.ec_revert_flag = 'N'
+      AND s.tran_flag = 'N' AND s.ec_revert_flag = 'N'
     GROUP BY s.acc_no
 ),
 
@@ -103,7 +94,7 @@ contract_pick AS (
                ) rn
         FROM DMSDBA.CONTRACT c
         LEFT JOIN DMSDBA.RDBBANK rb2 ON c.stu_bank_code = rb2.bank_code
-        WHERE EXISTS (SELECT 1 FROM scope_list s WHERE s.CID = c.cid) -- Join Scope
+        WHERE EXISTS (SELECT 1 FROM scope_list s WHERE s.CID = c.cid)
     )
     WHERE rn = 1
 ),
@@ -116,12 +107,12 @@ log_cal_max AS (
     lc.account_no,
     MAX(lc.cal_date) AS max_cal_date
   FROM DMS.DMS_LOG_CAL lc
-  WHERE EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = lc.account_no) -- Join Scope
+  WHERE EXISTS (SELECT 1 FROM scope_list s WHERE s.ACC_NO = lc.account_no)
   GROUP BY lc.account_no
 ),
 
 /* =========================================================
- 7) main_data: query หลัก
+ 7) main_data: Query หลัก (Calculation Core)
 ========================================================= */
 main_data AS (
     SELECT /*+
@@ -147,7 +138,6 @@ main_data AS (
            rsm.group_flag,
            fr.restructure_flag,
 
-           -- จำนวนเงินที่ต้องชำระต่อเดือน (ตาม Installment Plan V2)
            CASE
              WHEN fr.restructure_flag = 'Y' AND ip.account_no IS NOT NULL THEN NVL(ip.installment_amt, 0)
              ELSE 0
@@ -156,54 +146,54 @@ main_data AS (
            rsm.no_of_late_bill,
            NVL(bs.cnt_default, 0) AS cnt_default,
 
-           ktb.o_bs_capital_remain AS "เงินต้นคงเหลือ",
+           /* ------------------------------------------------------------------
+              *** ให้เหมือนสคริปต์เล็ก ***
+              เงินต้นคงเหลือ/ดอกเบี้ย/เบี้ยปรับ ใช้จาก MV_KTB_DAY
+           ------------------------------------------------------------------ */
+           ktb.O_BS_CAPITAL_REMAIN  AS principal_remain,
+           ktb.O_BS_ACCRUED_INTEREST AS interest_total,
+           ktb.O_BS_ACCRUED_FINE     AS fine_total,
 
-           -- [NEW Logic] แยกเงินต้นค้างชำระ V1 / V2
-           NVL(tbs1.ACCRUED_INSTALLMENT, 0) AS "เงินต้นค้างชำระ (V1)",
-           NVL(tbs2.ACCRUED_INSTALLMENT, 0) AS "เงินต้นค้างชำระ (V2)",
-
-           -- [NEW Logic] แยกดอกเบี้ยเงินต้นค้างชำระ V1 / V2
+           /* ------------------------------------------------------------------
+              V1/V2 breakdown (คง logic เดิม แต่ใช้ pick_version ใหม่จาก bill_ver)
+           ------------------------------------------------------------------ */
+           NVL(tbs1.ACCRUED_INSTALLMENT, 0) AS principal_v1,
            (NVL(tbs1.ACCRUED_INTEREST, 0) +
             CASE WHEN bv.pick_version = 1 THEN NVL(tid.INTEREST, 0) ELSE 0 END
-           ) AS "ดอกเบี้ยรวม (V1)",
-
-           (NVL(tbs2.ACCRUED_INTEREST, 0) +
-            CASE WHEN bv.pick_version = 2 THEN NVL(tid.INTEREST, 0) ELSE 0 END
-           ) AS "ดอกเบี้ยรวม (V2)",
-
-           -- [NEW Logic] แยกเบี้ยปรับเงินต้นค้างชำระ V1 / V2
+           ) AS interest_v1,
            CASE
              WHEN fr.RESTRUCTURE_FLAG = 'Y' THEN NVL(tbs2.CARRY_FINE, 0)
              ELSE (NVL(tbs1.ACCRUED_FINE, 0) +
                    CASE WHEN bv.pick_version = 1 THEN NVL(tid.FINE, 0) ELSE 0 END)
-           END AS "เบี้ยปรับ (V1)",
+           END AS fine_v1,
 
+           NVL(tbs2.ACCRUED_INSTALLMENT, 0) AS principal_v2,
+           (NVL(tbs2.ACCRUED_INTEREST, 0) +
+            CASE WHEN bv.pick_version = 2 THEN NVL(tid.INTEREST, 0) ELSE 0 END
+           ) AS interest_v2,
            (NVL(tbs2.ACCRUED_FINE, 0) +
             CASE WHEN bv.pick_version = 2 THEN NVL(tid.FINE, 0) ELSE 0 END
-           ) AS "เบี้ยปรับ (V2)",
+           ) AS fine_v2,
 
-           -- ค่าธรรมเนียมต่างๆ
            NVL(la.fee_amt1, 0) + NVL(fc.fee1_new, 0) AS fee1_total,
            NVL(la.fee_amt2, 0) + NVL(fc.fee2_new, 0) AS fee2_total,
            NVL(la.fee_amt3, 0) + NVL(fc.fee3_new, 0) AS fee3_total,
            NVL(la.fee_amt4, 0) + NVL(fc.fee4_new, 0) AS fee4_total,
 
-           -- ยอดปิดบัญชี
            CASE
              WHEN NVL(fr.restructure_flag, 'N') <> 'Y'
                THEN NVL(tbs1.capital_remain, 0)
                   + NVL(tbs1.accrued_interest, 0)
                   + NVL(tbs1.accrued_fine, 0)
-                  + NVL(tid.interest, 0)
-                  + NVL(tid.fine, 0)
+                  + NVL(tid.interest, 0) + NVL(tid.fine, 0)
              WHEN fr.restructure_flag = 'Y'
                THEN NVL(tbs2.capital_remain, 0)
                   + NVL(tbs2.accrued_interest, 0)
                   + NVL(tbs2.carry_interest, 0)
                   + NVL(tid.interest, 0)
-           END AS "ภาระหนี้คงเหลือ (ยอดปิดบัญชี)",
+           END AS payoff_amount,
 
-           lc.max_cal_date AS "ข้อมูล ณ",
+           lc.max_cal_date AS data_as_of,
            ROW_NUMBER() OVER (PARTITION BY bc.acc_no ORDER BY bc.acc_no) AS rn
 
     FROM scope_list bc
@@ -214,19 +204,19 @@ main_data AS (
     LEFT JOIN DMSDBA.report_summary_month rsm ON ar.acc_no = rsm.acc_no
     LEFT JOIN DMSDBA.loan_account la ON bc.acc_no = la.acc_no
     LEFT JOIN DMS.dms_trn_input_for_recal fr ON bc.acc_no = fr.account_no
-
-    -- [JOIN 2 ครั้ง] แยก V1 / V2
     LEFT JOIN DMS.dms_trn_bill_summary tbs1 ON bc.acc_no = tbs1.account_no AND tbs1.version = 1
     LEFT JOIN DMS.dms_trn_bill_summary tbs2 ON bc.acc_no = tbs2.account_no AND tbs2.version = 2
-
     LEFT JOIN DMS.dms_trn_cal_int_add_day tid ON bc.acc_no = tid.account_no
-    LEFT JOIN DMS.mv_ktb_day_21_01_2026 ktb ON bc.acc_no = ktb.acc_no
+    LEFT JOIN DMS.mv_ktb_day_24_01_2026 ktb ON bc.acc_no = ktb.acc_no
     LEFT JOIN bill_stats bs ON bc.acc_no = bs.account_no
     LEFT JOIN inst_plan ip ON bc.acc_no = ip.account_no
     LEFT JOIN fee_calc fc ON bc.acc_no = fc.acc_no
-    LEFT JOIN log_cal_max lc ON bc.acc_no = lc.account_no -- [JOIN Log Cal]
+    LEFT JOIN log_cal_max lc ON bc.acc_no = lc.account_no
 )
 
+/* =========================================================
+ Final SELECT: Display Columns (ให้เหมือนสคริปต์เล็กตามชุดที่ต้องการ)
+========================================================= */
 SELECT /*+ PARALLEL(m 32) */
        "เลขประจำตัวประชาชน"         AS "CID",
        "เลขที่บัญชี"                 AS "ACC_NO",
@@ -235,21 +225,26 @@ SELECT /*+ PARALLEL(m 32) */
        total_amount                 AS "จำนวนเงินที่ต้องชำระต่อเดือน",
        no_of_late_bill              AS "จำนวนวันที่ผิดนัดชำระ",
        cnt_default                  AS "จำนวนงวดที่ผิดนัดชำระ",
-       "เงินต้นคงเหลือ",
 
-       -- แยก Column V1 / V2
-       "เงินต้นค้างชำระ (V1)",
-       "ดอกเบี้ยรวม (V1)",
-       "เบี้ยปรับ (V1)",
-       "เงินต้นค้างชำระ (V2)",
-       "ดอกเบี้ยรวม (V2)",
-       "เบี้ยปรับ (V2)",
+       -- ให้เหมือนสคริปต์เล็ก
+       principal_remain             AS "เงินต้นคงเหลือ",
+       interest_total               AS "ดอกเบี้ย",
+       fine_total                   AS "เบี้ยปรับ",
+
+       -- [NEW] แสดงยอดแยก V1/V2 (เหมือนกัน)
+       principal_v1                 AS "ยอดหนี้เงินต้นค้างชำระ (V1)",
+       interest_v1                  AS "ดอกเบี้ยเงินต้นค้างชำระ (V1)",
+       fine_v1                      AS "เบี้ยปรับเงินต้นค้างชำระ (V1)",
+
+       principal_v2                 AS "ยอดหนี้เงินต้นค้างชำระ (V2)",
+       interest_v2                  AS "ดอกเบี้ยเงินต้นค้างชำระ (V2)",
+       fine_v2                      AS "เบี้ยปรับเงินต้นค้างชำระ (V2)",
 
        fee1_total AS "fee 1",
        fee2_total AS "fee 2",
        fee3_total AS "fee 3",
        fee4_total AS "fee 4",
-       "ภาระหนี้คงเหลือ (ยอดปิดบัญชี)" AS "ยอดชำระเป็นบัญชีปกติ",
-       "ข้อมูล ณ"
+       payoff_amount                AS "ภาระหนี้คงเหลือ (ยอดปิดบัญชี)",
+       data_as_of                   AS "ข้อมูล ณ"
 FROM main_data m
 WHERE rn = 1;
