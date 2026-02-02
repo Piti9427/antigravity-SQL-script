@@ -7,8 +7,8 @@ WITH
 scope_list AS (
     SELECT
         /*+ MATERIALIZE PARALLEL(64) */
-        TRIM(ACC_NO) AS ACC_NO
-    FROM PGETMP.DSL_LIST_ACCOUNT_LOT1 --   WHERE TRIM(ACC_NO) = '5000173996'
+        DISTINCT TRIM(acc_no) AS acc_no
+    FROM PGETMP.DSL_LIST_ACCOUNT_LOT1
 ),
 /* =========================================================
  Cutoff งวดปัจจุบัน (ตาม version logic เดิม)
@@ -46,8 +46,49 @@ bill_ver AS (
     GROUP BY TRIM(b.account_no)
 ),
 /* =========================================================
- [NEW] bills_overdue: DPD จาก DMS_TRN_BILLS (STATUS=1)
- - นับจากบิลที่ "ไกลสุด" (MIN DUE_PERIOD) = DPD มาตรฐาน
+ bill_metrics: "ยอดค้างชำระ" จาก DMS_TRN_BILLS (STATUS=1)
+ ========================================================= */
+bill_metrics AS (
+    SELECT
+        /*+ MATERIALIZE PARALLEL(b 64) */
+        TRIM(b.account_no) AS account_no,
+        SUM(
+            CASE
+                WHEN TRIM(b.status) = '1' THEN NVL(b.installment_cal_amount, 0)
+                ELSE 0
+            END
+        ) AS stat1_sum_installment,
+        SUM(
+            CASE
+                WHEN TRIM(b.status) = '1' THEN NVL(b.interest_cal_amount, 0)
+                ELSE 0
+            END
+        ) AS stat1_sum_interest,
+        SUM(
+            CASE
+                WHEN TRIM(b.status) = '1' THEN NVL(b.fine_cal_amount, 0)
+                ELSE 0
+            END
+        ) AS stat1_sum_fine
+    FROM DMS.DMS_TRN_BILLS b
+        JOIN bill_ver bv ON bv.account_no = TRIM(b.account_no)
+        CROSS JOIN cutoff_v1 v1
+        CROSS JOIN cutoff_v2 v2
+    WHERE EXISTS (
+            SELECT 1
+            FROM scope_list s
+            WHERE s.ACC_NO = TRIM(b.account_no)
+        )
+        AND NVL(b.version, 1) = bv.pick_version
+        AND b.due_period IS NOT NULL
+        AND TRUNC(b.due_period) < CASE
+            WHEN bv.pick_version = 2 THEN v2.cutoff_date
+            ELSE v1.cutoff_date
+        END
+    GROUP BY TRIM(b.account_no)
+),
+/* =========================================================
+ bills_overdue: DPD จาก DMS_TRN_BILLS (STATUS=1)
  ========================================================= */
 bills_overdue AS (
     SELECT
@@ -68,6 +109,7 @@ bills_overdue AS (
         )
         AND TRIM(b.status) = '1'
         AND NVL(b.version, 1) = bv.pick_version
+        AND b.due_period IS NOT NULL
         AND TRUNC(b.due_period) < CASE
             WHEN bv.pick_version = 2 THEN v2.cutoff_date
             ELSE v1.cutoff_date
@@ -75,37 +117,30 @@ bills_overdue AS (
     GROUP BY TRIM(b.account_no)
 ),
 /* =========================================================
- main_data (ยึดของคุณ + เพิ่ม DPD)
+ main_data
  ========================================================= */
 main_data AS (
     SELECT
         /*+ QB_NAME(main)
          LEADING(bc)
-         USE_HASH(bc bv tbs1 tbs2 tid ktb fr bo)
+         USE_HASH(bc bv tbs1 tbs2 tid ktb bo bm)
          PARALLEL(64) */
         bc.ACC_NO AS "เลขที่บัญชี",
-        -- ✅ เพิ่มจำนวนวันที่ค้างชำระ
         NVL(bo.overdue_days, 0) AS "จำนวนวันที่ค้างชำระ",
         bo.overdue_first_due_period AS "วันที่เริ่มค้างชำระ",
         bo.overdue_last_due_period AS "งวดค้างชำระล่าสุด",
         bo.overdue_bill_cnt AS "จำนวนงวดค้างชำระ",
-        -- ====== ของเดิมที่คุณถามว่าทำไมตัด ======
         ktb.O_BS_CAPITAL_REMAIN AS "O_BS_CAPITAL_REMAIN",
         ktb.O_BS_ACCRUED_INTEREST AS "O_BS_ACCRUED_INTEREST",
         ktb.O_BS_ACCRUED_FINE AS "O_BS_ACCRUED_FINE",
-        -- ยอดหนี้ค้างชำระ (รวม) ของคุณเดิม
+        /* ✅ ยอดหนี้ค้างชำระ (รวม) = Bills STATUS=1 */
         (
-            NVL(tbs1.ACCRUED_INSTALLMENT, 0) + NVL(tbs2.ACCRUED_INSTALLMENT, 0) + NVL(tbs1.ACCRUED_INTEREST, 0) + NVL(tbs2.ACCRUED_INTEREST, 0) + NVL(tbs1.ACCRUED_FINE, 0) + NVL(tbs2.ACCRUED_FINE, 0)
+            NVL(bm.stat1_sum_installment, 0) + NVL(bm.stat1_sum_interest, 0) + NVL(bm.stat1_sum_fine, 0)
         ) AS "ยอดหนี้ค้างชำระ",
-        -- เบี้ยปรับที่พักไว้ ของคุณเดิม
+        /* ✅ เบี้ยปรับที่พักไว้ = CARRY_FINE_CAL จาก BILL_SUMMARY ตาม pick_version */
         CASE
-            WHEN fr.RESTRUCTURE_FLAG = 'Y' THEN NVL(tbs2.CARRY_FINE, 0)
-            ELSE (
-                NVL(tbs1.ACCRUED_FINE, 0) + CASE
-                    WHEN bv.pick_version = 1 THEN NVL(tid.FINE, 0)
-                    ELSE 0
-                END
-            )
+            WHEN bv.pick_version = 2 THEN NVL(tbs2.CARRY_FINE_CAL, 0)
+            ELSE NVL(tbs1.CARRY_FINE_CAL, 0)
         END AS "เบี้ยปรับที่พักไว้",
         ROW_NUMBER() OVER (
             PARTITION BY bc.ACC_NO
@@ -113,12 +148,12 @@ main_data AS (
         ) AS rn
     FROM scope_list bc
         LEFT JOIN bill_ver bv ON bc.ACC_NO = bv.account_no
+        LEFT JOIN bill_metrics bm ON bc.ACC_NO = bm.account_no
         LEFT JOIN bills_overdue bo ON bc.ACC_NO = bo.account_no
         LEFT JOIN DMS.DMS_TRN_BILL_SUMMARY tbs1 ON bc.ACC_NO = TRIM(tbs1.ACCOUNT_NO)
         AND tbs1.VERSION = 1
         LEFT JOIN DMS.DMS_TRN_BILL_SUMMARY tbs2 ON bc.ACC_NO = TRIM(tbs2.ACCOUNT_NO)
         AND tbs2.VERSION = 2
-        LEFT JOIN DMS.DMS_TRN_INPUT_FOR_RECAL fr ON bc.ACC_NO = TRIM(fr.ACCOUNT_NO)
         LEFT JOIN DMS.DMS_TRN_CAL_INT_ADD_DAY tid ON bc.ACC_NO = TRIM(tid.ACCOUNT_NO)
         LEFT JOIN DMS.MV_KTB_DAY_01_02_2026 ktb ON bc.ACC_NO = TRIM(ktb.ACC_NO)
 )
@@ -136,3 +171,4 @@ SELECT
     "จำนวนวันที่ค้างชำระ"
 FROM main_data m
 WHERE rn = 1;
+-- 4213105
